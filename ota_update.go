@@ -1,56 +1,76 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"log"
 	"net"
 	"os"
 )
 
-const (
-	SERVER_IP   = "192.168.1.205"
-	SERVER_PORT = 3333
-	CHUNK_SIZE  = 1024
-)
+const chunkSize = 1024
 
-func launchOtaUpdate(firmwarePath string, ipAddr string, port int) {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", ipAddr, port))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Connection failed - %s\n", err)
-		os.Exit(1)
+func launchOtaUpdate(mcuIP, mcuPort string, certData, firmwareData []byte) error {
+    certPool := x509.NewCertPool()
+    if !certPool.AppendCertsFromPEM(certData) {
+        return fmt.Errorf("failed to append certs from PEM")
+    }
+
+    tlsConfig := &tls.Config{
+        RootCAs: certPool,
+	/* InsecureSkipVerify should be used for testing only */
+	InsecureSkipVerify: true,
+    }
+
+    conn, err := tls.Dial("tcp", net.JoinHostPort(mcuIP, mcuPort), tlsConfig)
+
+    if err != nil {
+        return fmt.Errorf("unable to connect: %w", err)
+    }
+    defer conn.Close()
+
+    for offset := 0; offset < len(firmwareData); offset += chunkSize {
+        end := offset + chunkSize
+        if end > len(firmwareData) {
+            end = len(firmwareData)
+        }
+
+        _, err := conn.Write(firmwareData[offset:end])
+        if err != nil {
+             return fmt.Errorf("error sending data: %w", err)
 	}
-	defer conn.Close()
+    }
 
-	file, err := os.Open(firmwarePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: File opening failed - %s\n", err)
-		os.Exit(1)
-	}
-	defer file.Close()
-
-	buffer := make([]byte, CHUNK_SIZE)
-	for {
-		bytesRead, err := file.Read(buffer)
-		if err != nil {
-			break
-		}
-		if bytesRead > 0 {
-			_, err = conn.Write(buffer[:bytesRead])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: Failed to send data - %s\n", err)
-				break
-			}
-		}
-	}
-
-	fmt.Printf("File %s sent successfully\n", firmwarePath)
+    fmt.Println("Firmware update sent successfully")
+    return nil
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <file_path>\n", os.Args[0])
-		os.Exit(1)
-	}
+    if len(os.Args) < 5 {
+        log.Fatal("Usage: go run ota_update.go <mcuIP> <mcuPort> <certFile> <firmwareFile>")
+    }
 
-	launchOtaUpdate(os.Args[1], SERVER_IP, SERVER_PORT)
+    mcuIP := os.Args[1]
+    mcuPort := os.Args[2]
+    certFilePath := os.Args[3]
+    firmwareFilePath := os.Args[4]
+
+    /* Cert File */
+    certData, err := os.ReadFile(certFilePath)
+    if err != nil {
+        log.Fatalf("Unable to read certificate file: %v", err)
+    }
+
+    /* Firmware file */
+    firmwareData, err := os.ReadFile(firmwareFilePath)
+    if err != nil {
+        log.Fatalf("Unable to read firmware file: %v", err)
+    }
+
+    err = launchOtaUpdate(mcuIP, mcuPort, certData, firmwareData)
+    if err != nil {
+        log.Fatalf("OTA update failed: %v", err)
+    }
 }
 
