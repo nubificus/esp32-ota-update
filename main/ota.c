@@ -24,8 +24,8 @@
 
 wifi_config_t wifi_config = {
 	.sta = {
-		.ssid = "nbfc-priv",
-		.password = "Add password here",
+		.ssid = "nbfc-iot",
+		.password = "...",
 		.threshold.authmode = WIFI_AUTH_WPA2_PSK,
 		.pmf_cfg = {
 			.capable = true,
@@ -135,9 +135,70 @@ esp_err_t connect_wifi() {
 
 static esp_partition_t* update_partition = NULL;
 static esp_ota_handle_t update_handle = 0;
-static size_t partition_data_written  = 0;
+static size_t partition_data_written;
+
+void ota_process_begin();
+esp_err_t ota_setup_partition_and_reboot();
+int ota_write_partition_from_tcp_stream();
+
+unsigned char rx_buffer[1024];
+char addr_str[128];
+int addr_family;
+int ip_protocol;
+struct sockaddr_in destAddr;
+int listen_sock;
+struct sockaddr_in sourceAddr;
+uint addrLen = sizeof(sourceAddr);
+
+void tcp_server_start() {
+	static bool started = false;
+
+	if (started)
+		return;
+
+	destAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	destAddr.sin_family = AF_INET;
+	destAddr.sin_port = htons(PORT);
+	addr_family = AF_INET;
+	ip_protocol = IPPROTO_IP;
+	inet_ntoa_r(destAddr.sin_addr, addr_str, sizeof(addr_str) - 1);
+
+	listen_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
+	if (listen_sock < 0) {
+		ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+		vTaskDelete(NULL);
+		return;
+	}
+	ESP_LOGI(TAG, "Socket created");
+
+	int err = bind(listen_sock, (struct sockaddr*) &destAddr, sizeof(destAddr));
+	if (err != 0) {
+		ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
+		ESP_LOGE(TAG, "IPPROTO: %d", ip_protocol);
+		close(listen_sock);
+		vTaskDelete(NULL);
+		return;
+	}
+	ESP_LOGI(TAG, "Socket bound, port %d", PORT);
+
+	err = listen(listen_sock, 1);
+	if (err != 0) {
+		ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
+		close(listen_sock);
+		vTaskDelete(NULL);
+		return;
+	}
+
+	ESP_LOGI(TAG, "Socket listening");
+	started = true;
+}
+
+void ota_service_start() {
+    xTaskCreate(&ota_process_begin, "OTAServiceTask", 8192, NULL, 5, NULL);
+}
 
 void ota_process_begin() {
+	partition_data_written = 0;
 	update_partition = esp_ota_get_next_update_partition(NULL);
 	assert(update_partition != NULL);
 
@@ -148,8 +209,22 @@ void ota_process_begin() {
 		while(1)
 			vTaskDelay(1000);
 	}
-	
+
 	ESP_LOGI(TAG, "esp_ota_begin succeeded");
+
+	tcp_server_start();
+
+	if (ota_write_partition_from_tcp_stream() < 0) {
+		esp_ota_end(update_handle);
+                ESP_LOGE(TAG, "Failed to receive the new image.. Starting listening again.");
+                ota_process_begin();
+        }
+
+        err = ota_setup_partition_and_reboot();
+	if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+		ESP_LOGE(TAG, "Image validation failed, image is corrupted.. Starting again.");
+		ota_process_begin();
+	}
 }
 
 void ota_append_data_to_partition(unsigned char* data, size_t len) {
@@ -163,21 +238,17 @@ void ota_append_data_to_partition(unsigned char* data, size_t len) {
 	partition_data_written += len;
 }
 
-void ota_setup_partition_and_reboot() {
+esp_err_t ota_setup_partition_and_reboot() {
 	
 	ESP_LOGI(TAG, "Total bytes read: %d", partition_data_written);
 
 	esp_err_t err = esp_ota_end(update_handle);
 	if (err != ESP_OK) {
-		if (err == ESP_ERR_OTA_VALIDATE_FAILED) 
-			ESP_LOGE(TAG, "Image validation failed, image is corrupted");
-		else 
-			ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
-        	
-		while (1)
-			vTaskDelay(1000);
+		ESP_LOGE(TAG, "esp_ota_end() returned error");
+		return err;
 	}
-	
+	ESP_LOGI(TAG, "esp_ota_end() returned success");
+
 	err = esp_ota_set_boot_partition(update_partition);
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
@@ -189,49 +260,11 @@ void ota_setup_partition_and_reboot() {
 	vTaskDelay(4000 / portTICK_PERIOD_MS);
 	
 	esp_restart();
+
+	return ESP_OK;
 }
 
 int ota_write_partition_from_tcp_stream() {
-    unsigned char rx_buffer[1024];
-    char addr_str[128];
-    int addr_family;
-    int ip_protocol;
-
-    struct sockaddr_in destAddr;
-    destAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    destAddr.sin_family = AF_INET;
-    destAddr.sin_port = htons(PORT);
-    addr_family = AF_INET;
-    ip_protocol = IPPROTO_IP;
-    inet_ntoa_r(destAddr.sin_addr, addr_str, sizeof(addr_str) - 1);
-
-    int listen_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
-    if (listen_sock < 0) {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-        vTaskDelete(NULL);
-        return -1;
-    }
-    ESP_LOGI(TAG, "Socket created");
-
-    int err = bind(listen_sock, (struct sockaddr*) &destAddr, sizeof(destAddr));
-    if (err != 0) {
-        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        ESP_LOGE(TAG, "IPPROTO: %d", ip_protocol);
-        close(listen_sock);
-        vTaskDelete(NULL);
-        return -1;
-    }
-    ESP_LOGI(TAG, "Socket bound, port %d", PORT);
-
-    err = listen(listen_sock, 1);
-    if (err != 0) {
-        ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
-        close(listen_sock);
-        vTaskDelete(NULL);
-        return -1;
-    }
-    
-    ESP_LOGI(TAG, "Socket listening");
     struct sockaddr_in sourceAddr;
     uint addrLen = sizeof(sourceAddr);
     int sock = accept(listen_sock, (struct sockaddr *)&sourceAddr, &addrLen);
@@ -239,9 +272,8 @@ int ota_write_partition_from_tcp_stream() {
 	    ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
 	    return -1;
     }
-  
     ESP_LOGI(TAG, "Socket accepted");
-        
+
     while (1) {
 	    int len = recv(sock, rx_buffer, sizeof(rx_buffer), 0);
             if (len < 0) {
@@ -259,9 +291,8 @@ int ota_write_partition_from_tcp_stream() {
     ESP_LOGI(TAG, "Closing the socket...");
     shutdown(sock, 0);
     close(sock);
-       
+
     ESP_LOGI(TAG, "Now all the data has been received");
-    
     return 1;
 }
 
@@ -283,12 +314,7 @@ void app_main(void) {
 		return;
 	}
 
-	ota_process_begin();
+	ota_service_start();
 
-	if (ota_write_partition_from_tcp_stream() < 0) {
-		ESP_LOGE(TAG, "Failed to update");
-		while (1) vTaskDelay(1000);
-	}
-	
-	ota_setup_partition_and_reboot();
+	while (1) vTaskDelay(1000);
 }
