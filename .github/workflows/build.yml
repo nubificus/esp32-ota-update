@@ -26,6 +26,8 @@ jobs:
     env:
       ESP32_KEY1: |
         ${{ secrets.ESP32_KEY1 }}
+      ESP32_KEY2: |
+        ${{ secrets.ESP32_KEY2 }}
 
     steps:
       - name: Cleanup previous jobs
@@ -58,7 +60,7 @@ jobs:
           policy: 1
 
 
-      - name: Build signed Firmware
+      - name: Build signed Firmware (single)
         uses: addnab/docker-run-action@v3
         id: build_signed_firmware
         with:
@@ -78,5 +80,27 @@ jobs:
           secret-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           local-path: build/ota.bin
           remote-path: nbfc-assets/github/iot/${{ github.event.repository.name }}-signed/
+          policy: 1
+
+      - name: Build signed Firmware (multiple)
+        uses: addnab/docker-run-action@v3
+        id: build_signed_multiple_firmware
+        with:
+          image: harbor.nbfc.io/nubificus/esp-idf:x86_64
+          options: -v ${{ github.workspace }}:/work --privileged
+          run: |
+            cd /esp-idf && . ./export.sh
+            cd /work
+            echo "${{ env.ESP32_KEY2 }} " > secure_boot_signing_key.pem
+            idf.py -DSDKCONFIG=sdkconfig.secure build
+
+      - name: Upload firmware to s3
+        uses: cloudkernels/minio-upload@v4
+        with:
+          url: https://s3.nubificus.co.uk
+          access-key: ${{ secrets.AWS_ACCESS_KEY }}
+          secret-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          local-path: build/ota.bin
+          remote-path: nbfc-assets/github/iot/${{ github.event.repository.name }}-signed-multi/
           policy: 1
 
